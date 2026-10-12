@@ -1,6 +1,6 @@
 # Price Controls & Surplus: explainer video
 
-`price_controls_surplus.mp4` is a 1:45, 1080p, silent video with on-screen captions. It shows how a binding
+`price_controls_surplus.mp4` is a 1:45, 1080p video with on-screen captions and a synthesized soundtrack. It shows how a binding
 **price ceiling** and a binding **price floor** change consumer surplus (CS), producer surplus (PS), and create
 **deadweight loss** (DWL). The triangles, trapezoids and transfer rectangles are drawn and animated on a
 supply-and-demand graph, next to a live "surplus scorecard".
@@ -30,6 +30,20 @@ Assumptions (stated on screen):
 - Under the ceiling, the scarce units go to the buyers who value them most.
 - Under the floor, only the 40 units demanded get produced, by the lowest-cost sellers.
 
+## Motion and sound
+
+- **Shapes:**
+  - Surplus areas sweep in from the price axis rather than fading in.
+  - The price-control line drops in and settles with a small overshoot.
+  - Each transfer rectangle is painted over in the colour of the side that gains it.
+  - The DWL triangle snaps in under a collapsing ring, and its hatching draws itself.
+- **Spotlight:** everything except the region the caption is talking about dims.
+- **Annotations:** points pop in, guides and arrows extend outward, and the scorecard numbers enlarge briefly while they change.
+- **Soundtrack:** synthesized from scratch in Python, so there are no audio assets or licences.
+  - Music: a soft D–Bm–G–A pad with a plucked arpeggio at 90 BPM.
+  - Sound effects (whooshes, pops, a thud and chimes) are timed from the same constants that drive the animation.
+  - The mix is loudness-normalized to −14 LUFS.
+
 ## Re-rendering
 
 Requires Python 3 with Pillow, plus ffmpeg built with libx264.
@@ -37,6 +51,7 @@ Requires Python 3 with Pillow, plus ffmpeg built with libx264.
 ```sh
 python3 make_video.py                      # -> price_controls_surplus.mp4 (~3 min on 4 cores)
 python3 make_video.py --stills 20,45,80    # PNG frames at those timestamps, for quick checks
+python3 make_video.py --no-audio           # silent version
 ```
 
 Scene timings, captions and the model all live in `make_video.py`. `check_model()` asserts that every shaded

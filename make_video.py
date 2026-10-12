@@ -13,6 +13,7 @@ Model (linear, chosen so every area is a round number):
 Usage:
     python3 make_video.py                         # renders price_controls_surplus.mp4
     python3 make_video.py --stills 12,40,95       # writes PNG stills for those times (s)
+    python3 make_video.py --no-audio              # skip the synthesized soundtrack
 
 Requires Pillow and ffmpeg (libx264). No other dependencies.
 """
@@ -138,6 +139,49 @@ def pulse(u, a, end):
     return on * (0.65 + 0.35 * math.cos((u - a) * 2 * math.pi * 1.4))
 
 
+def ease_out(x):
+    x = clamp(x)
+    return 1 - (1 - x) ** 3
+
+
+def back(x, s=1.7):
+    """Ease-out with overshoot: runs past 1, then settles back to exactly 1."""
+    x = clamp(x) - 1
+    return 1 + x * x * ((s + 1) * x + s)
+
+
+def pop(a):
+    """Scale factor for an element appearing with progress a: overshoots, then settles at 1."""
+    return back(a, 2.4) if a < 1 else 1.0
+
+
+def clip_poly(poly, axis, cut, keep_le=True):
+    """Clip a polygon to q <= cut (axis 0) or p <= cut (axis 1); keep_le=False keeps >= instead."""
+    def inside(pt):
+        return pt[axis] <= cut if keep_le else pt[axis] >= cut
+
+    def cross(a, b):
+        t = (cut - a[axis]) / (b[axis] - a[axis])
+        return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+
+    out = []
+    for i in range(len(poly)):
+        a, b = poly[i - 1], poly[i]
+        if inside(b):
+            if not inside(a):
+                out.append(cross(a, b))
+            out.append(b)
+        elif inside(a):
+            out.append(cross(a, b))
+    return out
+
+
+def scale_poly(poly, k):
+    cx = sum(q for q, _ in poly) / len(poly)
+    cy = sum(p for _, p in poly) / len(poly)
+    return [(cx + (q - cx) * k, cy + (p - cy) * k) for q, p in poly]
+
+
 # --------------------------------------------------------------------------- drawing helpers
 
 _FONTS = {}
@@ -188,6 +232,19 @@ class View:
 
 
 MAIN = View(170, 150, 1090, 850)
+
+_BG = {}
+
+
+def background(small=False):
+    """Soft radial vignette, built once per process."""
+    if not _BG:
+        g = Image.radial_gradient("L").resize((W * SS, H * SS), Image.BILINEAR)
+        hi = Image.new("RGB", (W * SS, H * SS), (17, 22, 37))
+        lo = Image.new("RGB", (W * SS, H * SS), (11, 14, 24))
+        _BG["big"] = Image.composite(lo, hi, g)
+        _BG["small"] = _BG["big"].reduce(SS)
+    return _BG["small" if small else "big"]
 PANEL = (1180, 150, 1850, 860)
 
 
@@ -215,14 +272,15 @@ def arrow_head(d, tip, direction, size, fill):
                (base[0] - px * size * 0.5, base[1] - py * size * 0.5)], fill=fill)
 
 
-def hatch(d, pts, fill, spacing, width):
-    """45-degree hatching clipped to a convex polygon (pixel coords)."""
+def hatch(d, pts, fill, spacing, width, frac=1.0):
+    """45-degree hatching clipped to a convex polygon (pixel coords); frac < 1 draws only the first lines."""
     n = len(pts)
     signed = sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1] for i in range(n))
     orient = 1 if signed > 0 else -1
     cs = [x - y for x, y in pts]
     c = math.floor(min(cs) / spacing) * spacing
-    while c <= max(cs):
+    c_end = lerp(c, max(cs), frac)
+    while c <= c_end:
         tmin, tmax, ok = -1e9, 1e9, True
         for i in range(n):
             ax, ay = pts[i]
@@ -301,7 +359,7 @@ def draw_rich_line(d, x, y, text, size, a, base=TEXT):
     draw_words(d, x * SS, y * SS, markup_words(text), fp, fb, a, base)
 
 
-def draw_caption(d, text, a, top=920, size=34, maxw=1640):
+def draw_caption(d, text, a, top=920, size=34, maxw=1640, rise=0.0):
     if a <= 0.01:
         return
     fp, fb = rich_fonts(size)
@@ -331,7 +389,7 @@ def draw_caption(d, text, a, top=920, size=34, maxw=1640):
             break
         lines, limit = trial, limit - 10 * SS
     lh = size * 1.42 * SS
-    y0 = (top + size) * SS + (lh / 2 if len(lines) == 1 else 0)
+    y0 = (top + size + rise) * SS + (lh / 2 if len(lines) == 1 else 0)
     for i, (ws, lw) in enumerate(lines):
         draw_words(d, (W * SS - lw) / 2, y0 + i * lh, ws, fp, fb, a)
 
@@ -359,10 +417,11 @@ def draw_chart(d, ch):
 
     # filled regions
     for poly, col in ch["pieces"]:
-        d.polygon([P(*q) for q in poly], fill=col)
-    for poly, a in ch["hatch"]:
-        if a > 0.01:
-            hatch(d, [P(*q) for q in poly], rgba(DWL_C, 0.9 * a), 11 * sc * SS, px(2))
+        if len(poly) >= 3:
+            d.polygon([P(*q) for q in poly], fill=col)
+    for poly, a, frac in ch["hatch"]:
+        if a > 0.01 and frac > 0.01:
+            hatch(d, [P(*q) for q in poly], rgba(DWL_C, 0.9 * a), 11 * sc * SS, px(2), frac)
     def outline(poly, col, a, w):
         if a > 0.01:
             pts = [P(*q) for q in poly]
@@ -375,10 +434,10 @@ def draw_chart(d, ch):
     ea = ch["eq"]
 
     def vguide(q, p, a, col=MUTED):
-        dashed(d, P(q, 0), P(q, p), rgba(col, a), px(2), 7 * sc, 6 * sc)
+        dashed(d, P(q, p), P(q, p * (1 - ease_out(a))), rgba(col, min(1, 2 * a)), px(2), 7 * sc, 6 * sc)
 
     if ea > 0:
-        dashed(d, P(0, PE), P(QE, PE), rgba(MUTED, ea), px(2), 7 * sc, 6 * sc)
+        dashed(d, P(QE, PE), P(QE * (1 - ease_out(ea)), PE), rgba(MUTED, min(1, 2 * ea)), px(2), 7 * sc, 6 * sc)
         vguide(QE, PE, ea)
     for q, p, a, col in ch["vguides"]:
         if a > 0.01:
@@ -433,8 +492,9 @@ def draw_chart(d, ch):
     # shortage / excess-supply bracket
     b = ch["bracket"]
     if b and b["a"] > 0.01:
-        p0, p1 = P(b["q0"], b["p"]), P(b["q1"], b["p"])
-        col = rgba(CTRL_C, b["a"])
+        mid, g = (b["q0"] + b["q1"]) / 2, ease_out(b["a"])
+        p0, p1 = P(lerp(mid, b["q0"], g), b["p"]), P(lerp(mid, b["q1"], g), b["p"])
+        col = rgba(CTRL_C, min(1, 2 * b["a"]))
         d.line([p0, p1], fill=col, width=px(3))
         arrow_head(d, (p0[0] - px(1), p0[1]), (-1, 0), px(14), col)
         arrow_head(d, (p1[0] + px(1), p1[1]), (1, 0), px(14), col)
@@ -449,11 +509,11 @@ def draw_chart(d, ch):
     # points
     if ea > 0:
         e = P(QE, PE)
-        dot(d, e, 7 * sc, TEXT, ea)
+        dot(d, e, 7 * sc * pop(ea), TEXT, min(1, 3 * ea))
         draw_text(d, (e[0], e[1] - px(14)), "E", font=font(26 * sc, "Bold"), fill=rgba(TEXT, ea), anchor="mb")
     for q, p, col, a in ch["dots"]:
         if a > 0.01:
-            dot(d, P(q, p), 7 * sc, col, a)
+            dot(d, P(q, p), 7 * sc * pop(a), col, min(1, 3 * a))
 
     # axis ticks
     def ptick(p, txt, col, a):
@@ -481,6 +541,7 @@ def draw_chart(d, ch):
         if a <= 0.01:
             continue
         cx, cy = P(L["q"], L["p"])
+        cy += px(16 * (1 - ease_out(a)))
         col = rgba((255, 255, 255), a)
         if L.get("compact"):
             draw_text(d, (cx, cy - px(2)), f"{L['title']} {money(L['value'])}", font=font(23 * sc, "Bold"), fill=col, anchor="ms")
@@ -506,8 +567,12 @@ def draw_chart(d, ch):
             continue
         tx, ty = P(L["tq"], L["tp"])
         sx, sy = P(L["q"], L["p"])
-        d.line([(sx, sy), (tx, ty + px(L.get("lead_dy", 0)))], fill=rgba(DWL_C, a), width=px(2))
-        dot(d, (sx, sy), 4.5 * sc, DWL_C, a)
+        end = lerp2((sx, sy), (tx, ty + px(L.get("lead_dy", 0))), ease_out(min(1, 1.7 * a)))
+        d.line([(sx, sy), end], fill=rgba(DWL_C, min(1, 3 * a)), width=px(2))
+        dot(d, (sx, sy), 4.5 * sc * pop(min(1, 2 * a)), DWL_C, min(1, 3 * a))
+        a = clamp(2 * a - 1)
+        if a <= 0.01:
+            continue
         tw = font(23 * sc, "SemiBold").getlength(L["title"])
         d.rounded_rectangle([tx - tw / 2 - px(10), ty - px(34), tx + tw / 2 + px(10), ty + px(38)],
                             radius=px(10), fill=rgba(BG, a), outline=rgba(mix(BG, DWL_C, 0.5), a), width=px(2))
@@ -539,7 +604,9 @@ def draw_panel(d, pv, a):
         y = y0 + 84 + i * 124
         d.ellipse([(x0 + 34) * SS, (y + 14) * SS, (x0 + 50) * SS, (y + 30) * SS], fill=rgba(col, a))
         draw_text(d, ((x0 + 62) * SS, (y + 22) * SS), label, font=font(26, "Medium"), fill=rgba(TEXT, a), anchor="lm")
-        draw_text(d, ((x1 - 32) * SS, (y + 22) * SS), money(val), font=font(34, "Bold"), fill=rgba(col, a), anchor="rm")
+        bump = pv.get("pop", {}).get(("cs", "ps", "dwl", "tot")[i], 0.0)
+        draw_text(d, ((x1 - 32) * SS, (y + 22) * SS), money(val), font=font(34 * (1 + 0.16 * bump), "Bold"),
+                  fill=rgba(mix(col, (255, 255, 255), 0.35 * bump), a), anchor="rm")
         delta = val - eqv if label != "Deadweight loss" else 0
         if pv["delta"] and abs(delta) >= 0.5:
             dc = GAIN_C if delta > 0 else LOSS_C
@@ -570,7 +637,7 @@ def draw_panel(d, pv, a):
     draw_text(d, ((x0 + 34) * SS, (y + 26) * SS), "Units traded", font=font(26, "Medium"), fill=rgba(TEXT, a), anchor="lm")
     q = pv["qty"]
     draw_text(d, ((x1 - 32) * SS, (y + 26) * SS), "—" if q is None else f"{int(round(q))}",
-           font=font(34, "Bold"), fill=rgba(TEXT, a), anchor="rm")
+              font=font(34 * (1 + 0.16 * pv.get("pop", {}).get("qty", 0.0)), "Bold"), fill=rgba(TEXT, a), anchor="rm")
     if pv["delta"] and q is not None and abs(q - QE) >= 0.5:
         draw_text(d, ((x1 - 32) * SS, (y + 62) * SS), f"−{int(round(QE - q))} units", font=font(22, "SemiBold"),
                fill=rgba(LOSS_C, a * pv["delta"]), anchor="rm")
@@ -579,8 +646,9 @@ def draw_panel(d, pv, a):
 def draw_header(d, title, a):
     if a <= 0.01:
         return
+    x = (170 - 28 * (1 - ease_out(a))) * SS
     draw_text(d, (170 * SS, 54 * SS), "PRICE CONTROLS & ECONOMIC SURPLUS", font=font(19, "SemiBold"), fill=rgba(MUTED, a), anchor="ls")
-    draw_text(d, (170 * SS, 100 * SS), title, font=font(40, "Bold"), fill=rgba(TEXT, a), anchor="ls")
+    draw_text(d, (x, 100 * SS), title, font=font(40, "Bold"), fill=rgba(TEXT, a), anchor="ls")
 
 
 # --------------------------------------------------------------------------- scenes
@@ -598,21 +666,29 @@ def eq_base(ch):
 
 
 def scene_title(d, u):
-    a = prog(u, 0.2, 1.0) * (1 - prog(u, T_TITLE - 0.6, T_TITLE))
+    out = 1 - prog(u, T_TITLE - 0.6, T_TITLE)
     cx = W * SS / 2
-    draw_text(d, (cx, 372 * SS), "ECONOMICS EXPLAINER", font=font(24, "SemiBold"), fill=rgba(MUTED, a), anchor="ms")
-    draw_text(d, (cx, 470 * SS), "How Price Controls Change Surplus", font=font(80, "Bold"), fill=rgba(TEXT, a), anchor="ms")
-    draw_text(d, (cx, 540 * SS), "Price ceilings, price floors, and deadweight loss",
-           font=font(36, "Regular"), fill=rgba(MUTED, a), anchor="ms")
+
+    def stagger(i):
+        k = prog(u, 0.15 + 0.18 * i, 0.95 + 0.18 * i)
+        return k * out, (30 * (1 - ease_out(k)) - 14 * (1 - out)) * SS
+
+    a, dy = stagger(0)
+    draw_text(d, (cx, 372 * SS + dy), "ECONOMICS EXPLAINER", font=font(24, "SemiBold"), fill=rgba(MUTED, a), anchor="ms")
+    a, dy = stagger(1)
+    draw_text(d, (cx, 470 * SS + dy), "How Price Controls Change Surplus", font=font(80, "Bold"), fill=rgba(TEXT, a), anchor="ms")
+    a, dy = stagger(2)
+    draw_text(d, (cx, 540 * SS + dy), "Price ceilings, price floors, and deadweight loss",
+              font=font(36, "Regular"), fill=rgba(MUTED, a), anchor="ms")
     chips = [("Consumer surplus", CS_FILL, CS_C, False), ("Producer surplus", PS_FILL, PS_C, False),
              ("Deadweight loss", DWL_FILL, DWL_C, True)]
     f = font(28, "Medium")
     gap, sq = 64 * SS, 30 * SS
     widths = [sq + 14 * SS + f.getlength(t) for t, *_ in chips]
     x = cx - (sum(widths) + gap * (len(chips) - 1)) / 2
-    y = 650 * SS
-    a2 = a * prog(u, 0.8, 1.6)
-    for (t, fill, edge, hat), w_ in zip(chips, widths):
+    for i, ((t, fill, edge, hat), w_) in enumerate(zip(chips, widths)):
+        a2, dy = stagger(3 + 0.6 * i)
+        y = 650 * SS + dy
         box = [x, y - sq / 2, x + sq, y + sq / 2]
         d.rectangle(box, fill=rgba(fill, a2), outline=rgba(edge, a2), width=2 * SS)
         if hat:
@@ -632,21 +708,24 @@ EQ_CAPTIONS = [
 def scene_eq(d, u):
     ch = new_chart(MAIN)
     ch["axes"] = prog(u, 0.0, 0.8)
-    ch["d"] = clamp((u - 0.6) / 1.4)
-    ch["s"] = clamp((u - 1.6) / 1.4)
+    ch["d"] = ease_out((u - 0.6) / 1.4)
+    ch["s"] = ease_out((u - 1.6) / 1.4)
     ch["d_label"] = prog(u, 1.8, 2.3)
     ch["s_label"] = prog(u, 2.8, 3.3)
     ch["eq"] = prog(u, 3.0, 3.6)
-    kcs, kps = prog(u, 5.0, 6.0), prog(u, 9.8, 10.8)
+    kcs, kps = prog(u, 5.0, 6.2), prog(u, 9.8, 11.0)
+    # surplus areas sweep in from the price axis toward E
     if kcs > 0:
-        ch["pieces"].append((POLY["cs_eq"], mix(BG, CS_FILL, kcs)))
+        ch["pieces"].append((clip_poly(POLY["cs_eq"], 0, QE * ease_out(kcs)), CS_FILL))
     if kps > 0:
-        ch["pieces"].append((POLY["ps_eq"], mix(BG, PS_FILL, kps)))
+        ch["pieces"].append((clip_poly(POLY["ps_eq"], 0, QE * ease_out(kps)), PS_FILL))
     ch["shapes"] = [(POLY["cs_eq"], CS_EDGE, pulse(u, 5.0, 8.8)), (POLY["ps_eq"], PS_EDGE, pulse(u, 9.8, 13.6))]
     ch["rlabels"].append(dict(q=20, p=58, title="CS", value=1800, a=prog(u, 5.6, 6.2)))
     ch["rlabels"].append(dict(q=20, p=30, title="PS", value=900, a=prog(u, 10.4, 11.0)))
     draw_chart(d, ch)
-    pv = dict(cs=1800 * kcs, ps=900 * kps, dwl=0, qty=QE if ch["eq"] > 0.5 else None, delta=0)
+    bump = lambda k: math.sin(math.pi * k)  # noqa: E731
+    pv = dict(cs=1800 * kcs, ps=900 * kps, dwl=0, qty=QE if ch["eq"] > 0.5 else None, delta=0,
+              pop=dict(cs=bump(kcs), ps=bump(kps), tot=max(bump(kcs), bump(kps))))
     draw_panel(d, pv, prog(u, 0.4, 1.4))
     draw_header(d, "Market equilibrium", prog(u, 0.0, 0.6) * (1 - prog(u, T_EQ - 0.6, T_EQ)))
     return EQ_CAPTIONS, None
@@ -671,7 +750,7 @@ CONTROL = {
         bracket=dict(q0=40, q1=70, p=24, label="Shortage = 30 units", lp=17.5),
         pieces=[("c_cs_keep", CS_FILL, None), ("dwl_top", CS_FILL, "dwl"), ("c_xfer", PS_FILL, "xfer"),
                 ("c_ps_keep", PS_FILL, None), ("dwl_bot", PS_FILL, "dwl")],
-        xfer_poly="c_xfer", xfer_to=CS_FILL, xfer_text="$400 transfer", xfer_at=(20, 35),
+        xfer_poly="c_xfer", xfer_to=CS_FILL, xfer_wipe=(40, 30), xfer_text="$400 transfer", xfer_at=(20, 35),
         dcs=(400, -200), dps=(-400, -100),
         cs_final=(15, 63), ps_final=(12, 23.5), ps_compact=True,
         cs_poly="c_cs_new", cs_shape="trapezoid", ps_poly="c_ps_keep", ps_shape="triangle",
@@ -693,7 +772,7 @@ CONTROL = {
         bracket=dict(q0=40, q1=100, p=65, label="Excess supply = 60 units", lp=70.5),
         pieces=[("f_cs_keep", CS_FILL, None), ("f_xfer", CS_FILL, "xfer"), ("dwl_top", CS_FILL, "dwl"),
                 ("f_ps_keep", PS_FILL, None), ("dwl_bot", PS_FILL, "dwl")],
-        xfer_poly="f_xfer", xfer_to=PS_FILL, xfer_text="$800 transfer", xfer_at=(20, 50),
+        xfer_poly="f_xfer", xfer_to=PS_FILL, xfer_wipe=(40, 60), xfer_text="$800 transfer", xfer_at=(20, 50),
         dcs=(-800, -200), dps=(800, -100),
         cs_final=(13, 75.5), ps_final=(15, 30), ps_compact=False,
         cs_poly="f_cs_keep", cs_shape="triangle", ps_poly="f_ps_new", ps_shape="trapezoid",
@@ -716,7 +795,7 @@ def build_control_chart(view, cfg, u, out, mini=False):
     ch = new_chart(view)
     eq_base(ch)
     a_line = prog(u, T_LINE[0], T_LINE[0] + 0.4) * out
-    k_line = smooth((u - T_LINE[0]) / (T_LINE[1] - T_LINE[0]))
+    k_line = back((u - T_LINE[0]) / (T_LINE[1] - T_LINE[0]), 2.2)  # drops in and settles
     a_dots = prog(u, *T_DOTS) * out
     a_trade = prog(u, *T_TRADE) * out
     k1 = prog(u, *T_XFER) * out
@@ -724,19 +803,33 @@ def build_control_chart(view, cfg, u, out, mini=False):
     a_shape_cs = prog(u, T_SHAPES, T_SHAPES + 0.6) * out
     a_shape_ps = prog(u, T_SHAPES + 1.0, T_SHAPES + 1.6) * out
 
+    # spotlight: dim everything except the region the caption is talking about
+    dim_x = 0 if mini else prog(u, T_XFER_PULSE, T_XFER_PULSE + 0.5) * (1 - prog(u, 15.2, 15.7)) * out
+    dim_d = 0 if mini else prog(u, T_DWL_PULSE, T_DWL_PULSE + 0.5) * (1 - prog(u, 20.6, 21.1)) * out
+
+    def lit(col, kind):
+        dim = (dim_x if kind != "xfer" else 0) + (dim_d if kind != "dwl" else 0)
+        return mix(col, BG, 0.55 * dim)
+
     for key, base, kind in cfg["pieces"]:
-        col = base
-        if kind == "xfer":
-            col = mix(base, cfg["xfer_to"], k1)
-        elif kind == "dwl":
-            col = mix(base, DWL_FILL, k2)
-        ch["pieces"].append((POLY[key], col))
-    ch["hatch"].append((POLY["dwl"], k2))
+        col = mix(base, DWL_FILL, k2) if kind == "dwl" else base
+        ch["pieces"].append((POLY[key], lit(col, kind)))
+        if kind == "xfer" and k1 > 0:
+            # the new owner's colour sweeps across the rectangle from their side
+            start, end = cfg["xfer_wipe"]
+            part = clip_poly(POLY[key], 1, lerp(start, end, ease_out(k1)), keep_le=end > start)
+            ch["pieces"].append((part, lit(cfg["xfer_to"], kind)))
+    ch["hatch"].append((POLY["dwl"], min(1.0, 3 * k2), ease_out(k2)))
+    if not mini:
+        # a ring that collapses onto the deadweight-loss triangle as it appears
+        kp = clamp((u - T_DWL[0]) / 0.8) * out
+        if 0 < kp < 1:
+            ch.setdefault("shapes", []).append((scale_poly(POLY["dwl"], lerp(1.6, 1.0, ease_out(kp))), DWL_C, 1 - kp))
 
     if not mini:
         ch["outlines"].append((POLY[cfg["xfer_poly"]], TEXT, pulse(u, T_XFER_PULSE, T_XFER[1] + 0.3) * out))
         ch["outlines"].append((POLY["dwl"], TEXT, pulse(u, T_DWL_PULSE, T_DWL[1] + 0.3) * out))
-    ch["shapes"] = [(POLY[cfg["cs_poly"]], CS_EDGE, a_shape_cs), (POLY[cfg["ps_poly"]], PS_EDGE, a_shape_ps)]
+    ch.setdefault("shapes", []).extend([(POLY[cfg["cs_poly"]], CS_EDGE, a_shape_cs), (POLY[cfg["ps_poly"]], PS_EDGE, a_shape_ps)])
 
     ch["ctrl"] = dict(p=lerp(PE, cfg["price"], k_line), a=a_line, tag=cfg["tag"],
                       tag_a=prog(u, T_LINE[1] - 0.3, T_LINE[1] + 0.2) * out,
@@ -768,7 +861,9 @@ def build_control_chart(view, cfg, u, out, mini=False):
         c = dict(cfg["callout"])
         c.update(title="Deadweight loss", value=300, a=prog(u, T_DWL[1] - 0.3, T_DWL[1] + 0.3) * out)
         ch["callouts"].append(c)
-    return ch, dict(cs=cs_val, ps=ps_val, dwl=300 * k2, qty=lerp(QE, 40, a_trade), delta=1.0)
+    b1, b2 = math.sin(math.pi * k1), math.sin(math.pi * k2)
+    return ch, dict(cs=cs_val, ps=ps_val, dwl=300 * k2, qty=lerp(QE, 40, a_trade), delta=1.0,
+                    pop=dict(cs=max(b1, b2), ps=max(b1, b2), dwl=b2, tot=b2, qty=math.sin(math.pi * a_trade)))
 
 
 def scene_control(d, u, kind):
@@ -808,6 +903,9 @@ def scene_summary(d, u):
         a = prog(u, 0.2 + 0.5 * i, 1.0 + 0.5 * i)
         if a <= 0.01:
             continue
+        ty0 = y0
+        rise = round(44 * (1 - ease_out(a)))
+        y0, y1 = y0 + rise, y1 + rise
         # draw the card (with its chart) on a copy, then blend it in, so the whole card fades as one
         layer = target.copy() if a < 0.999 else target
         ld = ImageDraw.Draw(layer, "RGBA")
@@ -818,11 +916,11 @@ def scene_summary(d, u):
         ch, _ = build_control_chart(view, CONTROL[kind], 99.0, 1.0, mini=True)
         draw_chart(ld, ch)
         if layer is not target:
-            box = ((x0 - 4) * SS, (y0 - 4) * SS, (x1 + 4) * SS, (y1 + 4) * SS)
+            box = ((x0 - 4) * SS, (ty0 - 4) * SS, (x1 + 4) * SS, (y1 + 4) * SS)
             target.paste(Image.blend(target.crop(box), layer.crop(box), a), box[:2])
         for j, line in enumerate(lines):
             la = prog(u, 1.6 + 0.35 * j + 0.5 * i, 2.2 + 0.35 * j + 0.5 * i)
-            draw_rich_line(d, x0 + 40, y0 + 600 + j * 47, line, 26, la)
+            draw_rich_line(d, x0 + 40, ty0 + 600 + j * 47 + 14 * (1 - ease_out(la)), line, 26, la)
     draw_header(d, "Summary", prog(u, 0.0, 0.6))
     return SUM_CAPTIONS, None
 
@@ -834,7 +932,7 @@ def caption_alpha(u, a, b):
 
 
 def render(t):
-    im = Image.new("RGB", (W * SS, H * SS), BG)
+    im = background().copy()
     d = ImageDraw.Draw(im, "RGBA")
     fade = 1.0
     caps, foot = [], None
@@ -855,12 +953,12 @@ def render(t):
         caps, foot = scene_summary(d, u)
         fade = prog(u, 0.0, 0.5) * (1 - prog(u, T_SUM - 0.8, T_SUM))
     for a, b, text in caps:
-        draw_caption(d, text, caption_alpha(u, a, b))
+        draw_caption(d, text, caption_alpha(u, a, b), rise=18 * (1 - ease_out((u - a) / 0.5)))
     if foot:
         draw_footnote(d, foot[2], caption_alpha(u, foot[0], foot[1]))
     im = im.reduce(SS)
     if fade < 0.999:
-        im = Image.blend(Image.new("RGB", (W, H), BG), im, max(0.0, fade))
+        im = Image.blend(background(small=True), im, max(0.0, fade))
     return im
 
 
@@ -868,11 +966,151 @@ def render_bytes(i):
     return render(i / FPS).tobytes()
 
 
+# --------------------------------------------------------------------------- soundtrack
+
+SR = 32000
+BPM = 90
+
+
+def sfx_events():
+    """(time, kind) for every sound effect, derived from the same timeline constants as the picture."""
+    ev = [(0.35, "chime_title"), (S_EQ + 0.0, "whoosh"), (S_EQ + 0.6, "draw"), (S_EQ + 1.6, "draw"),
+          (S_EQ + 3.05, "pop"), (S_EQ + 5.0, "sweep"), (S_EQ + 5.7, "tick"), (S_EQ + 9.8, "sweep"),
+          (S_EQ + 10.5, "tick"), (S_EQ + 14.5, "chime")]
+    for s0 in (S_CEIL, S_FLOOR):
+        ev += [(s0 + T_LINE[0] - 0.15, "whoosh"), (s0 + T_LINE[0] + 0.75, "thud"),
+               (s0 + T_DOTS[0] + 0.05, "pop"), (s0 + T_DOTS[0] + 0.2, "pop"), (s0 + T_BRACKET[0] + 0.1, "stretch"),
+               (s0 + T_TRADE[0] + 0.05, "tick"), (s0 + T_XFER[0], "sweep"), (s0 + T_XFER[1] + 0.05, "pop"),
+               (s0 + T_DWL[0] - 0.05, "loss"), (s0 + T_DWL[1] - 0.2, "pop"),
+               (s0 + T_SHAPES + 0.05, "chime"), (s0 + T_SHAPES + 1.05, "chime_low")]
+    ev += [(S_CEIL + 31.3, "whoosh"), (S_FLOOR + T_FLOOR - 1.0, "whoosh"),
+           (S_SUM + 0.15, "whoosh"), (S_SUM + 0.65, "whoosh"), (S_SUM + 1.6, "tick"), (S_SUM + 2.1, "tick"),
+           (S_SUM + 12.8, "chime_title")]
+    return ev
+
+
+def synth_audio(path):
+    """Write a mono WAV: a soft four-chord pad with a plucked arpeggio, plus sound effects on the beats."""
+    import array
+    import random
+    import wave
+
+    rnd = random.Random(7)
+    tau = 2 * math.pi
+    n = int((DURATION + 1) * SR)
+
+    def hz(m):
+        return 440.0 * 2 ** ((m - 69) / 12)
+
+    # ---- music: one 4-chord loop (D, Bm, G, A), synthesized once and tiled
+    beat = 60 / BPM
+    chord_len = 8 * beat
+    chords = [[50, 57, 62, 66, 69], [47, 54, 62, 66, 69], [43, 50, 59, 62, 66], [45, 52, 57, 61, 64]]
+    loop_n = int(4 * chord_len * SR)
+    loop = [0.0] * loop_n
+    for ci, notes in enumerate(chords):
+        s0 = int(ci * chord_len * SR)
+        span = chord_len + 1.6
+        for m in notes:
+            amp = 0.05 if m < 55 else 0.035
+            for det in (-0.07, 0.07):
+                w = tau * hz(m + det) / SR
+                for k in range(int(span * SR)):
+                    t = k / SR
+                    env = min(1.0, t / 1.4) * min(1.0, max(0.0, (span - t) / 1.6))
+                    loop[(s0 + k) % loop_n] += amp * env * math.sin(w * k)
+    lp = 0.0  # gentle low-pass to keep the pad warm
+    for i in range(loop_n):
+        lp += 0.18 * (loop[i] - lp)
+        loop[i] = lp
+    pattern = [2, 3, 4, 3, 2, 4, 3, 4]
+    for ci, notes in enumerate(chords):
+        for b in range(8):
+            f = hz(notes[pattern[b]] + 12)
+            s0 = int((ci * chord_len + b * beat) * SR)
+            for k in range(int(0.7 * SR)):
+                t = k / SR
+                v = math.exp(-t * 6.5) * (math.sin(tau * f * t) + 0.25 * math.sin(2 * tau * f * t))
+                loop[(s0 + k) % loop_n] += 0.045 * v
+    music = [loop[i % loop_n] for i in range(n)]
+    for i in range(n):
+        t = i / SR
+        music[i] *= min(1.0, t / 2.5) * min(1.0, max(0.0, (DURATION - t) / 3.0))
+
+    # ---- sound effects
+    fx = [0.0] * n
+
+    def add(t0, gen, length):
+        s0 = int(t0 * SR)
+        for k in range(int(length * SR)):
+            if 0 <= s0 + k < n:
+                fx[s0 + k] += gen(k / SR)
+
+    def chirp(f0, f1, rate, decay, amp, length, harm=0.0):
+        ph = [0.0]
+
+        def g(t):
+            f = f1 + (f0 - f1) * math.exp(-t * rate)
+            ph[0] += tau * f / SR
+            return amp * math.exp(-t * decay) * (math.sin(ph[0]) + harm * math.sin(2 * ph[0]))
+        return g, length
+
+    def noise(dur, amp, bright, shape=lambda u: math.sin(math.pi * u) ** 2):
+        y = [0.0, 0.0]
+
+        def g(t):
+            u = t / dur
+            c = 0.03 + bright * math.sin(math.pi * u)
+            y[0] += c * (rnd.uniform(-1, 1) - y[0])
+            y[1] += c * (y[0] - y[1])
+            return amp * shape(u) * y[1] * 4
+        return g, dur
+
+    def bell(notes, amp, decay):
+        def g(t):
+            return amp * sum(math.sin(tau * hz(m) * t) * math.exp(-t * decay * (1 + 0.4 * j))
+                             for j, m in enumerate(notes)) * min(1.0, t * 200)
+        return g, 2.2
+
+    kinds = {
+        "pop": lambda: chirp(1100, 520, 35, 26, 0.30, 0.2, 0.2),
+        "tick": lambda: chirp(2600, 2200, 60, 70, 0.12, 0.06),
+        "thud": lambda: chirp(150, 48, 12, 7, 0.32, 0.5, 0.15),
+        "loss": lambda: chirp(220, 70, 3.5, 3.2, 0.24, 1.2, 0.3),
+        "draw": lambda: noise(1.4, 0.10, 0.10),
+        "whoosh": lambda: noise(0.75, 0.16, 0.22),
+        "sweep": lambda: noise(1.3, 0.18, 0.16),
+        "stretch": lambda: chirp(500, 1400, -1.0, 4, 0.0, 0.01),
+        "chime": lambda: bell([81, 86, 88], 0.075, 2.4),
+        "chime_low": lambda: bell([74, 78, 81], 0.075, 2.4),
+        "chime_title": lambda: bell([74, 78, 81, 86], 0.07, 1.6),
+    }
+    for t0, kind in sfx_events():
+        if kind == "stretch":  # rising zip for the shortage / excess-supply arrow
+            ph = [0.0]
+
+            def g(t, ph=ph):
+                ph[0] += tau * (500 + 2200 * t) / SR
+                return 0.10 * math.sin(math.pi * t / 0.35) * math.sin(ph[0])
+            add(t0, g, 0.35)
+            continue
+        gen, length = kinds[kind]()
+        add(t0, gen, length)
+
+    out = array.array("h", (int(32767 * math.tanh(0.8 * music[i] + fx[i])) for i in range(n)))
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SR)
+        w.writeframes(out.tobytes())
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("output", nargs="?", default="price_controls_surplus.mp4")
     ap.add_argument("--stills", help="comma-separated times (s) to export as PNGs instead of a video")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
+    ap.add_argument("--no-audio", action="store_true", help="render a silent video")
     args = ap.parse_args()
     check_model()
 
@@ -886,9 +1124,16 @@ def main():
 
     n = int(round(DURATION * FPS))
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-           "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-",
-           "-c:v", "libx264", "-preset", "slow", "-crf", "20", "-pix_fmt", "yuv420p",
-           "-movflags", "+faststart", args.output]
+           "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-"]
+    if not args.no_audio:
+        wav = os.path.splitext(args.output)[0] + ".soundtrack.wav"
+        print("synthesizing soundtrack...", file=sys.stderr)
+        synth_audio(wav)
+        cmd += ["-i", wav, "-map", "0:v", "-map", "1:a",
+                "-af", "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000", "-ac", "2",
+                "-c:a", "aac", "-b:a", "192k", "-shortest"]
+    cmd += ["-c:v", "libx264", "-preset", "slow", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", args.output]
     enc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
     with Pool(args.jobs) as pool:
         for i, frame in enumerate(pool.imap(render_bytes, range(n), chunksize=6)):
@@ -898,6 +1143,8 @@ def main():
     enc.stdin.close()
     if enc.wait() != 0:
         sys.exit("ffmpeg failed")
+    if not args.no_audio:
+        os.remove(wav)
     print(f"\nwrote {args.output} ({n} frames, {DURATION:.1f}s)", file=sys.stderr)
 
 
